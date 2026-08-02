@@ -1,0 +1,2226 @@
+%pip install ortools pandas openpyxl
+import calendar
+from datetime import date, datetime, timedelta
+
+import pandas as pd
+from ortools.sat.python import cp_model
+# ==========================================================
+# CELL 3: DEFINE THE ROTA PERIOD
+# ==========================================================
+
+# The rota should begin on a Monday so that every rota week
+# runs cleanly from Monday to Sunday.
+
+START_DATE = pd.Timestamp("2026-08-03")
+
+# Change this value depending on the rota length:
+# 4  = 28-day test rota
+# 12 = 12-week rota
+# 52 = full 52-week rota (364 days)
+
+NUMBER_OF_WEEKS = 4
+
+
+# ----------------------------------------------------------
+# VALIDATION
+# ----------------------------------------------------------
+
+if NUMBER_OF_WEEKS < 1:
+    raise ValueError(
+        "NUMBER_OF_WEEKS must be at least 1."
+    )
+
+if START_DATE.day_name() != "Monday":
+    raise ValueError(
+        f"START_DATE must be a Monday. "
+        f"{START_DATE.date()} is a "
+        f"{START_DATE.day_name()}."
+    )
+
+
+# ----------------------------------------------------------
+# GENERATE THE ROTA DATES
+# ----------------------------------------------------------
+
+NUMBER_OF_DAYS = NUMBER_OF_WEEKS * 7
+
+schedule_dates = [
+    START_DATE + pd.Timedelta(days=day_offset)
+    for day_offset in range(NUMBER_OF_DAYS)
+]
+
+
+# ----------------------------------------------------------
+# CREATE THE CALENDAR TABLE
+# ----------------------------------------------------------
+
+calendar_df = pd.DataFrame({
+    "date": pd.to_datetime(schedule_dates)
+})
+
+calendar_df["weekday"] = (
+    calendar_df["date"].dt.day_name()
+)
+
+calendar_df["iso_year"] = (
+    calendar_df["date"]
+    .dt.isocalendar()
+    .year
+    .astype(int)
+)
+
+calendar_df["iso_week"] = (
+    calendar_df["date"]
+    .dt.isocalendar()
+    .week
+    .astype(int)
+)
+
+calendar_df["week_key"] = list(
+    zip(
+        calendar_df["iso_year"],
+        calendar_df["iso_week"]
+    )
+)
+
+calendar_df["is_weekend"] = (
+    calendar_df["weekday"]
+    .isin(["Saturday", "Sunday"])
+)
+
+
+# ----------------------------------------------------------
+# VALIDATE THE GENERATED CALENDAR
+# ----------------------------------------------------------
+
+expected_end_date = (
+    START_DATE
+    + pd.Timedelta(days=NUMBER_OF_DAYS - 1)
+)
+
+if schedule_dates[-1] != expected_end_date:
+    raise RuntimeError(
+        "The rota end date was generated incorrectly."
+    )
+
+if schedule_dates[-1].day_name() != "Sunday":
+    raise RuntimeError(
+        "The rota period does not finish on a Sunday."
+    )
+
+generated_weeks = (
+    calendar_df["week_key"]
+    .drop_duplicates()
+    .tolist()
+)
+
+if len(generated_weeks) != NUMBER_OF_WEEKS:
+    raise RuntimeError(
+        "The generated number of ISO weeks does not "
+        "match NUMBER_OF_WEEKS."
+    )
+
+
+# ----------------------------------------------------------
+# DISPLAY THE RESULT
+# ----------------------------------------------------------
+
+print("=" * 65)
+print("ROTA SCHEDULING PERIOD")
+print("=" * 65)
+
+print(
+    "Start Date       :",
+    schedule_dates[0].strftime("%A %d %B %Y")
+)
+
+print(
+    "End Date         :",
+    schedule_dates[-1].strftime("%A %d %B %Y")
+)
+
+print(
+    "Number of Weeks  :",
+    NUMBER_OF_WEEKS
+)
+
+print(
+    "Number of Days   :",
+    NUMBER_OF_DAYS
+)
+
+print(
+    "Complete Weeks   :",
+    len(generated_weeks)
+)
+
+print(
+    "Starts Monday    :",
+    schedule_dates[0].day_name() == "Monday"
+)
+
+print(
+    "Ends Sunday      :",
+    schedule_dates[-1].day_name() == "Sunday"
+)
+
+print("=" * 65)
+
+display(calendar_df)
+# ==========================================================
+# CELL 4 - Load Input Data
+# ==========================================================
+
+import pandas as pd
+
+# Path to the Excel workbook
+EXCEL_FILE = r"C:\Users\tisal\Downloads\DATA AND LEAVE.xlsx"
+
+# ----------------------------------------------------------
+# Read Worksheets
+# ----------------------------------------------------------
+
+employees_df = pd.read_excel(
+    EXCEL_FILE,
+    sheet_name="Employees"
+)
+
+department_skills_df = pd.read_excel(
+    EXCEL_FILE,
+    sheet_name="Employee_Department_Skills"
+)
+
+leave_df = pd.read_excel(
+    EXCEL_FILE,
+    sheet_name="Leave"
+)
+
+unavailability_df = pd.read_excel(
+    EXCEL_FILE,
+    sheet_name="Unavailability"
+)
+
+store_requirements_df = pd.read_excel(
+    EXCEL_FILE,
+    sheet_name="Store_Requirements"
+)
+
+# ----------------------------------------------------------
+# Clean Column Names
+# ----------------------------------------------------------
+
+for dataframe in [
+    employees_df,
+    department_skills_df,
+    leave_df,
+    unavailability_df,
+    store_requirements_df
+]:
+    dataframe.columns = (
+        dataframe.columns
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+
+# ----------------------------------------------------------
+# Convert Data Types
+# ----------------------------------------------------------
+
+leave_df["start_date"] = pd.to_datetime(
+    leave_df["start_date"],
+    errors="raise"
+)
+
+leave_df["end_date"] = pd.to_datetime(
+    leave_df["end_date"],
+    errors="raise"
+)
+
+# Convert TRUE/FALSE employee columns safely
+boolean_columns = [
+    "till_trained",
+    "can_open",
+    "can_close"
+]
+
+for column in boolean_columns:
+
+    if column not in employees_df.columns:
+        raise ValueError(
+            f"Missing required column in Employees sheet: {column}"
+        )
+
+    employees_df[column] = (
+        employees_df[column]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .map({
+            "TRUE": True,
+            "FALSE": False,
+            "1": True,
+            "0": False
+        })
+    )
+
+    if employees_df[column].isna().any():
+        raise ValueError(
+            f"Column '{column}' contains invalid values. "
+            "Use TRUE or FALSE only."
+        )
+
+# ----------------------------------------------------------
+# Create Store Requirements Dictionary
+# ----------------------------------------------------------
+
+required_store_columns = {"parameter", "value"}
+
+if not required_store_columns.issubset(
+    store_requirements_df.columns
+):
+    raise ValueError(
+        "Store_Requirements sheet must contain "
+        "'parameter' and 'value' columns."
+    )
+
+store_requirements_df["parameter"] = (
+    store_requirements_df["parameter"]
+    .astype(str)
+    .str.strip()
+    .str.lower()
+)
+
+store_requirements = (
+    store_requirements_df
+    .set_index("parameter")["value"]
+    .to_dict()
+)
+
+required_parameters = [
+    "minimum_staff",
+    "minimum_managers",
+    "minimum_till_staff",
+    "minimum_openers",
+    "minimum_closers"
+]
+
+missing_parameters = [
+    parameter
+    for parameter in required_parameters
+    if parameter not in store_requirements
+]
+
+if missing_parameters:
+    raise ValueError(
+        "Missing Store_Requirements parameters: "
+        + ", ".join(missing_parameters)
+    )
+
+# ----------------------------------------------------------
+# Display Summary
+# ----------------------------------------------------------
+
+print("=" * 50)
+print("INPUT DATA SUCCESSFULLY LOADED")
+print("=" * 50)
+
+print(f"Employees               : {len(employees_df)}")
+print(f"Department Skill Records: {len(department_skills_df)}")
+print(f"Leave Requests          : {len(leave_df)}")
+print(f"Unavailability Records  : {len(unavailability_df)}")
+print(f"Store Requirements      : {len(store_requirements_df)}")
+
+print("\nEmployee Columns")
+print(employees_df.columns.tolist())
+
+print("\nEmployee Roles")
+print(employees_df["role"].value_counts())
+
+print("\nContract Hours")
+print(
+    employees_df["contract_hours"]
+    .value_counts()
+    .sort_index()
+)
+
+print("\nStore Requirements")
+
+for parameter in required_parameters:
+    print(
+        f"{parameter:<24}: "
+        f"{int(store_requirements[parameter])}"
+    )
+
+print("\nAll worksheets loaded successfully.")
+# ==========================================================
+# CELL 5 - Define Scheduling Sets
+# ==========================================================
+
+# Employee IDs
+employees = employees_df["employee_id"].tolist()
+
+# Dates included in the rota
+schedule_dates = calendar_df["date"].tolist()
+
+# Full-length and short working shifts
+shifts = [
+    "OPEN",
+    "MID",
+    "CLOSE",
+    "SHORT_OPEN",
+    "SHORT_CLOSE"
+]
+
+print("=" * 50)
+print("SCHEDULING SETS CREATED")
+print("=" * 50)
+
+print(f"Employees        : {len(employees)}")
+print(f"Scheduling Days  : {len(schedule_dates)}")
+print(f"Working Shifts   : {len(shifts)}")
+
+print("\nShift Types:")
+
+for shift in shifts:
+    print(f"- {shift}")
+# ==========================================================
+# CELL 6 - Decision Variables
+# ==========================================================
+
+model = cp_model.CpModel()
+
+# Dictionary storing all decision variables
+work = {}
+
+for employee in employees:
+
+    for day in schedule_dates:
+
+        for shift in shifts:
+
+            work[(employee, day, shift)] = model.NewBoolVar(
+                f"work_E{employee}_{day.strftime('%Y%m%d')}_{shift}"
+            )
+
+print("=" * 50)
+print("DECISION VARIABLES CREATED")
+print("=" * 50)
+
+print(f"Employees          : {len(employees)}")
+print(f"Days               : {len(schedule_dates)}")
+print(f"Working Shifts     : {len(shifts)}")
+
+print(f"\nTotal Variables : {len(work):,}")
+# ==========================================================
+# CELL 7 - LH01
+# One Shift Per Employee Per Day
+# ==========================================================
+
+constraint_count = 0
+
+for employee in employees:
+
+    for day in schedule_dates:
+
+        model.Add(
+            sum(work[(employee, day, shift)] for shift in shifts) <= 1
+        )
+
+        constraint_count += 1
+
+print("=" * 50)
+print("LH01 ADDED")
+print("=" * 50)
+
+print("Constraint:")
+print("Each employee can work at most one shift per day.\n")
+
+print(f"Constraints Added : {constraint_count:,}")
+# ==========================================================
+# CELL 8 - LH02
+# Approved Leave Constraint
+# ==========================================================
+
+constraint_count = 0
+
+# Only approved leave is treated as a hard constraint
+approved_leave = leave_df[
+    leave_df["status"] == "APPROVED"
+]
+
+# Faster lookup of scheduling dates
+schedule_date_set = set(schedule_dates)
+
+for _, leave in approved_leave.iterrows():
+
+    employee = leave["employee_id"]
+
+    leave_days = pd.date_range(
+        leave["start_date"],
+        leave["end_date"]
+    )
+
+    for day in leave_days:
+
+        day = day.date()
+
+        if day not in schedule_date_set:
+            continue
+
+        model.Add(
+            sum(
+                work[(employee, day, shift)]
+                for shift in shifts
+            ) == 0
+        )
+
+        constraint_count += 1
+
+print("=" * 50)
+print("LH02 ADDED")
+print("=" * 50)
+
+print("Constraint:")
+print("Employees cannot be scheduled during approved leave.\n")
+
+print(f"Constraints Added : {constraint_count:,}")
+# ==========================================================
+# CELL 9 - LH03
+# Weekly Unavailability Constraint
+# ==========================================================
+
+constraint_count = 0
+
+# Create a fast lookup dictionary
+unavailability_lookup = (
+    unavailability_df
+    .set_index("employee_id")
+    .to_dict("index")
+)
+
+for employee in employees:
+
+    # Skip employees with no recurring unavailability
+    if employee not in unavailability_lookup:
+        continue
+
+    employee_unavailability = unavailability_lookup[employee]
+
+    for day in schedule_dates:
+
+        weekday = day.strftime("%A").lower()
+
+        if employee_unavailability[weekday]:
+
+            model.Add(
+                sum(
+                    work[(employee, day, shift)]
+                    for shift in shifts
+                ) == 0
+            )
+
+            constraint_count += 1
+
+print("=" * 50)
+print("LH03 ADDED")
+print("=" * 50)
+
+print("Constraint:")
+print("Employees cannot work on their unavailable weekdays.\n")
+
+print(f"Constraints Added : {constraint_count:,}")
+# ==========================================================
+# CELL 10 - Shift Definitions
+# ==========================================================
+
+shift_details = {
+
+    "OPEN": {
+        "start": 9,
+        "end": 17,
+        "hours": 8
+    },
+
+    "MID": {
+        "start": 12,
+        "end": 20,
+        "hours": 8
+    },
+
+    "CLOSE": {
+        "start": 14,
+        "end": 22,
+        "hours": 8
+    },
+
+    "SHORT_OPEN": {
+        "start": 9,
+        "end": 13,
+        "hours": 4
+    },
+
+    "SHORT_CLOSE": {
+        "start": 18,
+        "end": 22,
+        "hours": 4
+    }
+}
+
+print("=" * 50)
+print("SHIFT DEFINITIONS CREATED")
+print("=" * 50)
+
+for shift, details in shift_details.items():
+
+    print(
+        f"{shift:<12} "
+        f"{details['start']:02d}:00-"
+        f"{details['end']:02d}:00 "
+        f"({details['hours']} hours)"
+    )
+# ==========================================================
+# CELL 11 - LH04: Contracted Working Hours
+# ==========================================================
+#
+# Contract hours are treated as a hard weekly target.
+# Approved leave reduces the number of hours that must be
+# physically worked during that week.
+#
+# This prevents contradictions such as requiring an employee
+# to work 40 hours while they are on approved leave all week.
+
+contract_hours_lookup = (
+    employees_df
+    .set_index("employee_id")["contract_hours"]
+    .astype(int)
+    .to_dict()
+)
+
+
+# ----------------------------------------------------------
+# Keep only approved leave records
+# ----------------------------------------------------------
+
+approved_leave_df = leave_df[
+    leave_df["status"]
+    .astype(str)
+    .str.strip()
+    .str.upper()
+    == "APPROVED"
+].copy()
+
+
+# Create a set of approved leave dates for every employee
+approved_leave_dates = {
+    employee: set()
+    for employee in employees
+}
+
+
+for _, leave_row in approved_leave_df.iterrows():
+
+    employee = leave_row["employee_id"]
+
+    if employee not in approved_leave_dates:
+        continue
+
+    leave_days = pd.date_range(
+        start=leave_row["start_date"],
+        end=leave_row["end_date"]
+    )
+
+    approved_leave_dates[employee].update(
+        leave_day.date()
+        for leave_day in leave_days
+    )
+
+
+# ----------------------------------------------------------
+# Group rota dates by ISO year and ISO week
+# ----------------------------------------------------------
+
+week_groups = {}
+
+for day in schedule_dates:
+
+    iso_calendar = pd.Timestamp(day).isocalendar()
+
+    week_key = (
+        int(iso_calendar.year),
+        int(iso_calendar.week)
+    )
+
+    week_groups.setdefault(
+        week_key,
+        []
+    ).append(day)
+
+
+# ----------------------------------------------------------
+# Add weekly contracted-hours constraints
+# ----------------------------------------------------------
+
+constraints_added = 0
+weekly_targets = []
+
+
+for employee in employees:
+
+    weekly_contract_hours = int(
+        contract_hours_lookup[employee]
+    )
+
+    for week_key, week_dates in week_groups.items():
+
+        days_in_rota_week = len(week_dates)
+
+        approved_leave_days = sum(
+            day in approved_leave_dates[employee]
+            for day in week_dates
+        )
+
+        schedulable_days = (
+            days_in_rota_week
+            - approved_leave_days
+        )
+
+        # Reduce weekly working hours in proportion to the
+        # number of rota days available after approved leave.
+        proportional_hours = (
+            weekly_contract_hours
+            * schedulable_days
+            / 7
+        )
+
+        # Round to the nearest 4 hours because the shortest
+        # available shift is 4 hours.
+        target_hours = int(
+            round(proportional_hours / 4) * 4
+        )
+
+        # Under the one-shift-per-day rule, an employee can
+        # work a maximum of 8 hours per schedulable day.
+        maximum_possible_hours = (
+            schedulable_days * 8
+        )
+
+        target_hours = min(
+            target_hours,
+            maximum_possible_hours
+        )
+
+        total_weekly_hours = sum(
+            work[(employee, day, shift)]
+            * shift_details[shift]["hours"]
+            for day in week_dates
+            for shift in shifts
+        )
+
+        model.Add(
+            total_weekly_hours == target_hours
+        )
+
+        constraints_added += 1
+
+        weekly_targets.append({
+            "employee_id": employee,
+            "iso_year": week_key[0],
+            "iso_week": week_key[1],
+            "days_in_period": days_in_rota_week,
+            "approved_leave_days": approved_leave_days,
+            "schedulable_days": schedulable_days,
+            "weekly_contract": weekly_contract_hours,
+            "target_hours": target_hours
+        })
+
+
+# ----------------------------------------------------------
+# Validation table
+# ----------------------------------------------------------
+
+weekly_targets_df = pd.DataFrame(
+    weekly_targets
+)
+
+
+print("=" * 60)
+print("LH04 - CONTRACTED HOURS ADDED")
+print("=" * 60)
+
+print(f"Employees               : {len(employees)}")
+print(f"Rota Weeks              : {len(week_groups)}")
+print(f"Constraints Added       : {constraints_added}")
+
+print(
+    "\nApproved leave now reduces the hours that must "
+    "be physically worked."
+)
+
+print("\nWeekly target examples:")
+
+display(
+    weekly_targets_df.head(15)
+)
+# ==========================================================
+# CELL 12 - LH05: Minimum 12-Hour Rest
+# ==========================================================
+
+MINIMUM_REST_HOURS = 12
+
+# Sort dates to ensure consecutive-day comparisons
+sorted_schedule_dates = sorted(schedule_dates)
+
+# Store incompatible shift combinations for checking
+incompatible_shift_pairs = []
+
+constraints_added = 0
+
+
+# ----------------------------------------------------------
+# Identify shift combinations that provide less than
+# 12 hours of rest between consecutive days
+# ----------------------------------------------------------
+
+for previous_shift in shifts:
+
+    previous_end_time = shift_details[previous_shift]["end"]
+
+    for next_shift in shifts:
+
+        next_start_time = shift_details[next_shift]["start"]
+
+        # The next shift begins on the following calendar day
+        rest_hours = (
+            24
+            - previous_end_time
+            + next_start_time
+        )
+
+        if rest_hours < MINIMUM_REST_HOURS:
+
+            incompatible_shift_pairs.append({
+                "previous_shift": previous_shift,
+                "next_shift": next_shift,
+                "rest_hours": rest_hours
+            })
+
+
+# ----------------------------------------------------------
+# Add constraints for each employee and consecutive day
+# ----------------------------------------------------------
+
+for employee in employees:
+
+    for day_index in range(len(sorted_schedule_dates) - 1):
+
+        current_day = sorted_schedule_dates[day_index]
+        next_day = sorted_schedule_dates[day_index + 1]
+
+        # Only compare genuinely consecutive calendar dates
+        if (
+            pd.Timestamp(next_day)
+            - pd.Timestamp(current_day)
+        ).days != 1:
+
+            continue
+
+        for pair in incompatible_shift_pairs:
+
+            previous_shift = pair["previous_shift"]
+            next_shift = pair["next_shift"]
+
+            # The employee cannot work both shifts
+            model.Add(
+                work[(employee, current_day, previous_shift)]
+                + work[(employee, next_day, next_shift)]
+                <= 1
+            )
+
+            constraints_added += 1
+
+
+incompatible_shift_pairs_df = pd.DataFrame(
+    incompatible_shift_pairs
+)
+
+
+print("=" * 60)
+print("LH05 - MINIMUM 12-HOUR REST ADDED")
+print("=" * 60)
+
+print(f"Minimum Rest Requirement     : {MINIMUM_REST_HOURS} hours")
+print(f"Incompatible Shift Pairs     : {len(incompatible_shift_pairs)}")
+print(f"Constraints Added            : {constraints_added}")
+
+print("\nForbidden consecutive shift combinations:")
+
+display(incompatible_shift_pairs_df)
+# ==========================================================
+# CELL 13 - LH06
+# Weekly Rest (At Least One Day Off Every 7 Days)
+# ==========================================================
+
+constraint_count = 0
+
+# Number of complete 7-day weeks
+num_weeks = len(schedule_dates) // 7
+
+for employee in employees:
+
+    for week in range(num_weeks):
+
+        week_days = schedule_dates[week * 7:(week + 1) * 7]
+
+        work_days = []
+
+        for day in week_days:
+
+            for shift in shifts:
+
+                work_days.append(
+                    work[(employee, day, shift)]
+                )
+
+        # Maximum 6 working days in any week
+        model.Add(sum(work_days) <= 6)
+
+        constraint_count += 1
+
+print("=" * 50)
+print("LH06 ADDED")
+print("=" * 50)
+
+print("Constraint:")
+print("Each employee must receive at least one full day off every week.\n")
+
+print(f"Constraints Added : {constraint_count:,}")
+# ==========================================================
+# CELL 14 - OPERATIONAL HARD CONSTRAINTS
+# ==========================================================
+
+# Read requirements from the Store_Requirements Excel sheet
+minimum_daily_staff = int(
+    store_requirements["minimum_staff"]
+)
+
+minimum_managers = int(
+    store_requirements["minimum_managers"]
+)
+
+minimum_till_staff = int(
+    store_requirements["minimum_till_staff"]
+)
+
+minimum_openers = int(
+    store_requirements["minimum_openers"]
+)
+
+minimum_closers = int(
+    store_requirements["minimum_closers"]
+)
+
+
+# ----------------------------------------------------------
+# Validate the daily staffing requirement
+# ----------------------------------------------------------
+
+if minimum_daily_staff != 10:
+
+    print(
+        "WARNING: minimum_staff in the Excel sheet is "
+        f"{minimum_daily_staff}, not 10."
+    )
+
+
+# ----------------------------------------------------------
+# Employee skill and role groups
+# ----------------------------------------------------------
+
+manager_roles = {
+    "Store Manager",
+    "Deputy Manager",
+    "Department Manager"
+}
+
+
+managers = employees_df.loc[
+    employees_df["role"].isin(manager_roles),
+    "employee_id"
+].tolist()
+
+
+till_staff = employees_df.loc[
+    employees_df["till_trained"] == True,
+    "employee_id"
+].tolist()
+
+
+openers = employees_df.loc[
+    employees_df["can_open"] == True,
+    "employee_id"
+].tolist()
+
+
+closers = employees_df.loc[
+    employees_df["can_close"] == True,
+    "employee_id"
+].tolist()
+
+
+# ----------------------------------------------------------
+# Operational coverage periods
+# ----------------------------------------------------------
+#
+# Opening coverage can be provided by:
+#   OPEN or SHORT_OPEN
+#
+# Middle coverage is provided by:
+#   MID
+#
+# Closing coverage can be provided by:
+#   CLOSE or SHORT_CLOSE
+#
+# These groups prevent the model from treating SHORT_OPEN
+# and SHORT_CLOSE as completely separate operating periods.
+
+coverage_periods = {
+
+    "OPENING": [
+        "OPEN",
+        "SHORT_OPEN"
+    ],
+
+    "MIDDLE": [
+        "MID"
+    ],
+
+    "CLOSING": [
+        "CLOSE",
+        "SHORT_CLOSE"
+    ]
+}
+
+
+constraints_added = 0
+
+
+# ==========================================================
+# OH01 - Minimum Employees Per Day
+# ==========================================================
+
+for day in schedule_dates:
+
+    model.Add(
+
+        sum(
+            work[(employee, day, shift)]
+
+            for employee in employees
+            for shift in shifts
+        )
+
+        >= minimum_daily_staff
+    )
+
+    constraints_added += 1
+
+
+# ==========================================================
+# OH02 - Minimum Managers During Each Coverage Period
+# ==========================================================
+
+for day in schedule_dates:
+
+    for period_name, period_shifts in coverage_periods.items():
+
+        model.Add(
+
+            sum(
+                work[(employee, day, shift)]
+
+                for employee in managers
+                for shift in period_shifts
+            )
+
+            >= minimum_managers
+        )
+
+        constraints_added += 1
+
+
+# ==========================================================
+# OH03 - Minimum Till-Trained Staff During Each Period
+# ==========================================================
+
+for day in schedule_dates:
+
+    for period_name, period_shifts in coverage_periods.items():
+
+        model.Add(
+
+            sum(
+                work[(employee, day, shift)]
+
+                for employee in till_staff
+                for shift in period_shifts
+            )
+
+            >= minimum_till_staff
+        )
+
+        constraints_added += 1
+
+
+# ==========================================================
+# OH04 - Minimum Qualified Opening Staff
+# ==========================================================
+
+opening_shifts = [
+    "OPEN",
+    "SHORT_OPEN"
+]
+
+
+for day in schedule_dates:
+
+    model.Add(
+
+        sum(
+            work[(employee, day, shift)]
+
+            for employee in openers
+            for shift in opening_shifts
+        )
+
+        >= minimum_openers
+    )
+
+    constraints_added += 1
+
+
+# ==========================================================
+# OH05 - Minimum Qualified Closing Staff
+# ==========================================================
+
+closing_shifts = [
+    "CLOSE",
+    "SHORT_CLOSE"
+]
+
+
+for day in schedule_dates:
+
+    model.Add(
+
+        sum(
+            work[(employee, day, shift)]
+
+            for employee in closers
+            for shift in closing_shifts
+        )
+
+        >= minimum_closers
+    )
+
+    constraints_added += 1
+
+
+# ----------------------------------------------------------
+# Validation output
+# ----------------------------------------------------------
+
+print("=" * 60)
+print("OPERATIONAL HARD CONSTRAINTS ADDED")
+print("=" * 60)
+
+print(f"Minimum Employees Per Day : {minimum_daily_staff}")
+print(f"Managers Per Period       : {minimum_managers}")
+print(f"Till Staff Per Period      : {minimum_till_staff}")
+print(f"Minimum Openers            : {minimum_openers}")
+print(f"Minimum Closers            : {minimum_closers}")
+
+print("\nEligible employee groups:")
+
+print(f"Managers Found             : {len(managers)}")
+print(f"Till-Trained Staff Found   : {len(till_staff)}")
+print(f"Qualified Openers Found    : {len(openers)}")
+print(f"Qualified Closers Found    : {len(closers)}")
+
+print("\nCoverage periods:")
+
+for period_name, period_shifts in coverage_periods.items():
+
+    print(
+        f"{period_name:<10}: "
+        f"{', '.join(period_shifts)}"
+    )
+
+print(f"\nConstraints Added          : {constraints_added}")
+###diagnosis
+
+
+# ==========================================================
+# DIAGNOSTIC - EMPLOYEE WEEKLY CAPACITY
+# ==========================================================
+
+approved_leave_clean = leave_df[
+    leave_df["status"]
+    .astype(str)
+    .str.strip()
+    .str.upper()
+    == "APPROVED"
+].copy()
+
+approved_leave_clean["start_date"] = pd.to_datetime(
+    approved_leave_clean["start_date"]
+).dt.date
+
+approved_leave_clean["end_date"] = pd.to_datetime(
+    approved_leave_clean["end_date"]
+).dt.date
+
+
+unavailability_lookup = (
+    unavailability_df
+    .set_index("employee_id")
+    .to_dict("index")
+)
+
+
+def employee_available(employee, day):
+
+    day = pd.Timestamp(day).date()
+    weekday = pd.Timestamp(day).strftime("%A").lower()
+
+    # Check recurring weekday unavailability
+    if employee in unavailability_lookup:
+
+        unavailable = unavailability_lookup[
+            employee
+        ].get(weekday, False)
+
+        if bool(unavailable):
+            return False
+
+    # Check approved leave
+    employee_leave = approved_leave_clean[
+        approved_leave_clean["employee_id"] == employee
+    ]
+
+    for _, leave_row in employee_leave.iterrows():
+
+        if (
+            leave_row["start_date"]
+            <= day
+            <= leave_row["end_date"]
+        ):
+            return False
+
+    return True
+
+
+capacity_rows = []
+
+for _, target_row in weekly_targets_df.iterrows():
+
+    employee = target_row["employee_id"]
+
+    week_key = (
+        int(target_row["iso_year"]),
+        int(target_row["iso_week"])
+    )
+
+    week_dates = week_groups[week_key]
+
+    available_dates = [
+        day
+        for day in week_dates
+        if employee_available(employee, day)
+    ]
+
+    available_days = len(available_dates)
+
+    # One shift per day, with the longest shift being 8 hours
+    maximum_possible_hours = available_days * 8
+
+    target_hours = int(
+        target_row["target_hours"]
+    )
+
+    capacity_rows.append({
+
+        "employee_id": employee,
+
+        "iso_week": week_key[1],
+
+        "target_hours": target_hours,
+
+        "available_days": available_days,
+
+        "maximum_possible_hours": maximum_possible_hours,
+
+        "possible_before_rest_rules":
+            maximum_possible_hours >= target_hours
+    })
+
+
+capacity_check_df = pd.DataFrame(capacity_rows)
+
+impossible_capacity_df = capacity_check_df[
+    capacity_check_df[
+        "possible_before_rest_rules"
+    ] == False
+].copy()
+
+
+print("=" * 70)
+print("EMPLOYEE WEEKLY CAPACITY CHECK")
+print("=" * 70)
+
+if impossible_capacity_df.empty:
+
+    print(
+        "No immediate employee-hour contradictions found."
+    )
+
+else:
+
+    print(
+        "These employee-weeks cannot meet their "
+        "contracted-hour targets:"
+    )
+
+    display(impossible_capacity_df)
+# ==========================================================
+# CELL 15 - SOFT CONSTRAINTS
+# ==========================================================
+
+# Reset the objective penalty list
+penalty_terms = []
+
+
+# ----------------------------------------------------------
+# Penalty weights
+# ----------------------------------------------------------
+#
+# Higher weight = more important for the solver to avoid.
+#
+# Requested leave is given the highest priority.
+# Closing and weekend fairness are lower-priority preferences.
+
+REQUESTED_LEAVE_WEIGHT = 100
+CLOSING_FAIRNESS_WEIGHT = 10
+WEEKEND_FAIRNESS_WEIGHT = 5
+
+
+# ----------------------------------------------------------
+# Prepare employee contract groups
+# ----------------------------------------------------------
+
+contract_hours_lookup = (
+    employees_df
+    .set_index("employee_id")["contract_hours"]
+    .astype(int)
+    .to_dict()
+)
+
+
+contract_groups = {}
+
+for employee in employees:
+
+    contract_hours = contract_hours_lookup[employee]
+
+    contract_groups.setdefault(
+        contract_hours,
+        []
+    ).append(employee)
+
+
+# ==========================================================
+# SC01 - Requested Leave
+# ==========================================================
+#
+# Requested leave is not guaranteed.
+#
+# If the solver schedules an employee during requested leave,
+# a large penalty is added to the objective.
+
+requested_leave_df = leave_df[
+    leave_df["status"]
+    .astype(str)
+    .str.strip()
+    .str.upper()
+    == "REQUESTED"
+].copy()
+
+
+requested_leave_assignments = 0
+
+
+for _, leave_row in requested_leave_df.iterrows():
+
+    employee = leave_row["employee_id"]
+
+    leave_start = pd.Timestamp(
+        leave_row["start_date"]
+    ).normalize()
+
+    leave_end = pd.Timestamp(
+        leave_row["end_date"]
+    ).normalize()
+
+    # Ignore leave records for employees not in the rota
+    if employee not in employees:
+        continue
+
+    for day in schedule_dates:
+
+        rota_day = pd.Timestamp(day).normalize()
+
+        if leave_start <= rota_day <= leave_end:
+
+            for shift in shifts:
+
+                penalty_terms.append(
+                    REQUESTED_LEAVE_WEIGHT
+                    * work[(employee, day, shift)]
+                )
+
+                requested_leave_assignments += 1
+
+
+# ==========================================================
+# SC02 - Fair Distribution of Closing Duties
+# ==========================================================
+#
+# Both full and short closing shifts count as closing duties.
+#
+# Fairness is compared only between employees with the same
+# weekly contracted hours.
+
+closing_shifts = [
+    "CLOSE",
+    "SHORT_CLOSE"
+]
+
+
+closing_duty_counts = {}
+
+closing_spread_variables = []
+
+
+for employee in employees:
+
+    closing_duty_counts[employee] = sum(
+
+        work[(employee, day, shift)]
+
+        for day in schedule_dates
+        for shift in closing_shifts
+    )
+
+
+for contract_hours, group_employees in contract_groups.items():
+
+    if len(group_employees) <= 1:
+        continue
+
+    maximum_closing_duties = model.NewIntVar(
+        0,
+        len(schedule_dates),
+        f"max_closing_{contract_hours}h"
+    )
+
+    minimum_closing_duties = model.NewIntVar(
+        0,
+        len(schedule_dates),
+        f"min_closing_{contract_hours}h"
+    )
+
+    for employee in group_employees:
+
+        model.Add(
+            closing_duty_counts[employee]
+            <= maximum_closing_duties
+        )
+
+        model.Add(
+            closing_duty_counts[employee]
+            >= minimum_closing_duties
+        )
+
+    closing_spread = model.NewIntVar(
+        0,
+        len(schedule_dates),
+        f"closing_spread_{contract_hours}h"
+    )
+
+    model.Add(
+        closing_spread
+        == maximum_closing_duties
+        - minimum_closing_duties
+    )
+
+    penalty_terms.append(
+        CLOSING_FAIRNESS_WEIGHT
+        * closing_spread
+    )
+
+    closing_spread_variables.append(
+        closing_spread
+    )
+
+
+# ==========================================================
+# SC03 - Fair Distribution of Weekend Work
+# ==========================================================
+#
+# A weekend duty means working any shift on a Saturday
+# or Sunday.
+#
+# Cell 7 permits only one shift per employee per day, so one
+# weekend date can contribute at most one weekend duty.
+
+weekend_dates = [
+
+    day for day in schedule_dates
+
+    if pd.Timestamp(day).weekday() in [5, 6]
+]
+
+
+weekend_duty_counts = {}
+
+weekend_spread_variables = []
+
+
+for employee in employees:
+
+    weekend_duty_counts[employee] = sum(
+
+        work[(employee, day, shift)]
+
+        for day in weekend_dates
+        for shift in shifts
+    )
+
+
+for contract_hours, group_employees in contract_groups.items():
+
+    if len(group_employees) <= 1:
+        continue
+
+    maximum_weekend_duties = model.NewIntVar(
+        0,
+        len(weekend_dates),
+        f"max_weekend_{contract_hours}h"
+    )
+
+    minimum_weekend_duties = model.NewIntVar(
+        0,
+        len(weekend_dates),
+        f"min_weekend_{contract_hours}h"
+    )
+
+    for employee in group_employees:
+
+        model.Add(
+            weekend_duty_counts[employee]
+            <= maximum_weekend_duties
+        )
+
+        model.Add(
+            weekend_duty_counts[employee]
+            >= minimum_weekend_duties
+        )
+
+    weekend_spread = model.NewIntVar(
+        0,
+        len(weekend_dates),
+        f"weekend_spread_{contract_hours}h"
+    )
+
+    model.Add(
+        weekend_spread
+        == maximum_weekend_duties
+        - minimum_weekend_duties
+    )
+
+    penalty_terms.append(
+        WEEKEND_FAIRNESS_WEIGHT
+        * weekend_spread
+    )
+
+    weekend_spread_variables.append(
+        weekend_spread
+    )
+
+
+# ----------------------------------------------------------
+# Validation output
+# ----------------------------------------------------------
+
+print("=" * 60)
+print("SOFT CONSTRAINTS ADDED")
+print("=" * 60)
+
+print(
+    f"Requested Leave Periods       : "
+    f"{len(requested_leave_df)}"
+)
+
+print(
+    f"Requested Leave Variables     : "
+    f"{requested_leave_assignments}"
+)
+
+print(
+    f"Contract Groups               : "
+    f"{len(contract_groups)}"
+)
+
+print(
+    f"Closing Fairness Measures     : "
+    f"{len(closing_spread_variables)}"
+)
+
+print(
+    f"Weekend Fairness Measures     : "
+    f"{len(weekend_spread_variables)}"
+)
+
+print(
+    f"Total Objective Terms         : "
+    f"{len(penalty_terms)}"
+)
+
+
+print("\nPenalty weights:")
+
+print(
+    f"Requested Leave               : "
+    f"{REQUESTED_LEAVE_WEIGHT}"
+)
+
+print(
+    f"Closing Fairness              : "
+    f"{CLOSING_FAIRNESS_WEIGHT}"
+)
+
+print(
+    f"Weekend Fairness              : "
+    f"{WEEKEND_FAIRNESS_WEIGHT}"
+)
+
+
+print("\nContract groups:")
+
+for contract_hours, group_employees in sorted(
+    contract_groups.items()
+):
+
+    print(
+        f"{contract_hours} hours: "
+        f"{len(group_employees)} employees"
+    )
+# ==========================================================
+# CELL 16 - OBJECTIVE FUNCTION
+# ==========================================================
+
+# Minimise all soft-constraint penalties created in Cell 15
+
+if len(penalty_terms) == 0:
+
+    raise ValueError(
+        "No penalty terms were created. "
+        "Run Cell 15 before running this cell."
+    )
+
+
+model.Minimize(
+    sum(penalty_terms)
+)
+
+
+print("=" * 60)
+print("OBJECTIVE FUNCTION CREATED")
+print("=" * 60)
+
+print(f"Penalty Terms Included : {len(penalty_terms)}")
+
+print("\nObjective priorities:")
+
+print(
+    f"1. Requested leave avoidance "
+    f"(weight {REQUESTED_LEAVE_WEIGHT})"
+)
+
+print(
+    f"2. Closing-duty fairness "
+    f"(weight {CLOSING_FAIRNESS_WEIGHT})"
+)
+
+print(
+    f"3. Weekend-duty fairness "
+    f"(weight {WEEKEND_FAIRNESS_WEIGHT})"
+)
+# ==========================================================
+# CELL 17 - SOLVE THE MODEL
+# ==========================================================
+
+solver = cp_model.CpSolver()
+
+
+# ----------------------------------------------------------
+# Solver settings
+# ----------------------------------------------------------
+
+# Maximum time allowed for the solver
+solver.parameters.max_time_in_seconds = 120
+
+# Use multiple CPU cores where available
+solver.parameters.num_search_workers = 8
+
+# Show solver progress in the notebook output
+solver.parameters.log_search_progress = True
+
+
+# ----------------------------------------------------------
+# Solve
+# ----------------------------------------------------------
+
+print("=" * 60)
+print("SOLVING ROTA MODEL")
+print("=" * 60)
+
+status = solver.Solve(model)
+
+
+# ----------------------------------------------------------
+# Interpret solver result
+# ----------------------------------------------------------
+
+status_name = solver.StatusName(status)
+
+print("\n" + "=" * 60)
+print("SOLVER RESULT")
+print("=" * 60)
+
+print(f"Status              : {status_name}")
+print(f"Solve Time          : {solver.WallTime():.2f} seconds")
+print(f"Conflicts           : {solver.NumConflicts()}")
+print(f"Branches            : {solver.NumBranches()}")
+
+
+if status in [
+    cp_model.OPTIMAL,
+    cp_model.FEASIBLE
+]:
+
+    print(f"Objective Value     : {solver.ObjectiveValue():.2f}")
+    print(f"Best Objective Bound: {solver.BestObjectiveBound():.2f}")
+
+    if status == cp_model.OPTIMAL:
+
+        print(
+            "\nThe solver found the best possible rota "
+            "under the current hard and soft constraints."
+        )
+
+    else:
+
+        print(
+            "\nThe solver found a valid rota, but it may not "
+            "be the best possible rota within the time limit."
+        )
+
+
+elif status == cp_model.INFEASIBLE:
+
+    print(
+        "\nThe model is infeasible."
+    )
+
+    print(
+        "This means no rota can satisfy all current hard "
+        "constraints at the same time."
+    )
+
+    print(
+        "\nPossible causes include:"
+    )
+
+    print(
+        "- insufficient manager availability;"
+    )
+
+    print(
+        "- insufficient till-trained, opening or closing staff;"
+    )
+
+    print(
+        "- exact contracted hours conflicting with leave "
+        "or unavailability;"
+    )
+
+    print(
+        "- minimum 12 employees per day being too high;"
+    )
+
+    print(
+        "- 12-hour rest and weekly-rest requirements reducing "
+        "available coverage."
+    )
+
+
+elif status == cp_model.MODEL_INVALID:
+
+    print(
+        "\nThe model is invalid."
+    )
+
+    print(
+        "Check the constraints, variable definitions and "
+        "objective function."
+    )
+
+
+else:
+
+    print(
+        "\nThe solver did not find a solution within the "
+        "allowed time."
+    )
+# ==========================================================
+# CELL 18 - EXTRACT THE SOLVED ROTA
+# ==========================================================
+
+rota_records = []
+
+
+# ----------------------------------------------------------
+# Create employee information lookups from the Excel sheet
+# ----------------------------------------------------------
+
+employee_name_lookup = (
+    employees_df
+    .set_index("employee_id")["employee_name"]
+    .to_dict()
+)
+
+employee_role_lookup = (
+    employees_df
+    .set_index("employee_id")["role"]
+    .to_dict()
+)
+
+employee_contract_hours_lookup = (
+    employees_df
+    .set_index("employee_id")["contract_hours"]
+    .astype(int)
+    .to_dict()
+)
+
+employee_contract_type_lookup = (
+    employees_df
+    .set_index("employee_id")["contract_type"]
+    .to_dict()
+)
+
+
+# ----------------------------------------------------------
+# Extract the rota only when a solution exists
+# ----------------------------------------------------------
+
+if status in (
+    cp_model.OPTIMAL,
+    cp_model.FEASIBLE
+):
+
+    for employee in employees:
+
+        for day in schedule_dates:
+
+            assigned_shift = "OFF"
+            assigned_hours = 0
+
+            for shift in shifts:
+
+                if solver.Value(
+                    work[(employee, day, shift)]
+                ) == 1:
+
+                    assigned_shift = shift
+
+                    assigned_hours = (
+                        shift_details[shift]["hours"]
+                    )
+
+                    break
+
+
+            rota_records.append({
+
+                "employee_id":
+                    employee,
+
+                "employee_name":
+                    employee_name_lookup[employee],
+
+                "role":
+                    employee_role_lookup[employee],
+
+                "contract_hours":
+                    employee_contract_hours_lookup[employee],
+
+                "contract_type":
+                    employee_contract_type_lookup[employee],
+
+                "date":
+                    pd.Timestamp(day).date(),
+
+                "day_name":
+                    pd.Timestamp(day).day_name(),
+
+                "shift":
+                    assigned_shift,
+
+                "hours":
+                    assigned_hours
+            })
+
+
+    # ------------------------------------------------------
+    # Create the rota dataframe
+    # ------------------------------------------------------
+
+    rota_df = pd.DataFrame(
+        rota_records
+    )
+
+
+    # Sort the table into a clear order
+    rota_df = (
+        rota_df
+        .sort_values(
+            by=[
+                "employee_id",
+                "date"
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+
+    # ------------------------------------------------------
+    # Display the result
+    # ------------------------------------------------------
+
+    print("=" * 60)
+    print("ROTA TABLE CREATED")
+    print("=" * 60)
+
+    print(
+        f"Employees included : "
+        f"{rota_df['employee_id'].nunique()}"
+    )
+
+    print(
+        f"Rota days included : "
+        f"{rota_df['date'].nunique()}"
+    )
+
+    print(
+        f"Rows created       : "
+        f"{len(rota_df):,}"
+    )
+
+    print(
+        f"Working shifts     : "
+        f"{(rota_df['shift'] != 'OFF').sum():,}"
+    )
+
+    print("=" * 60)
+
+    display(
+        rota_df.head(30)
+    )
+
+
+else:
+
+    print("=" * 60)
+    print("ROTA COULD NOT BE EXTRACTED")
+    print("=" * 60)
+
+    print(
+        "The solver did not find a feasible solution."
+    )
+
+    print(
+        "Solver status:",
+        solver.StatusName(status)
+    )
+# ==========================================================
+# CELL 19 - DISPLAY A SEPARATE ROTA TABLE FOR EACH WEEK
+# ==========================================================
+
+if status not in (
+    cp_model.OPTIMAL,
+    cp_model.FEASIBLE
+):
+
+    print(
+        "Weekly rota tables cannot be created because "
+        "the solver did not find a feasible solution."
+    )
+
+else:
+
+    # ------------------------------------------------------
+    # Create a copy so the original rota_df is unchanged
+    # ------------------------------------------------------
+
+    weekly_rota_df = rota_df.copy()
+
+    weekly_rota_df["date"] = pd.to_datetime(
+        weekly_rota_df["date"]
+    )
+
+
+    # ------------------------------------------------------
+    # Add ISO year and week number
+    # ------------------------------------------------------
+
+    iso_calendar = (
+        weekly_rota_df["date"]
+        .dt
+        .isocalendar()
+    )
+
+    weekly_rota_df["iso_year"] = (
+        iso_calendar["year"]
+        .astype(int)
+    )
+
+    weekly_rota_df["iso_week"] = (
+        iso_calendar["week"]
+        .astype(int)
+    )
+
+
+    # ------------------------------------------------------
+    # Add shift start and end times
+    # These are taken from the shift definitions already
+    # used by the optimisation model
+    # ------------------------------------------------------
+
+    weekly_rota_df["shift_start"] = (
+        weekly_rota_df["shift"]
+        .map(
+            lambda shift:
+                shift_details[shift]["start"]
+                if shift != "OFF"
+                else 99
+        )
+    )
+
+    weekly_rota_df["shift_end"] = (
+        weekly_rota_df["shift"]
+        .map(
+            lambda shift:
+                shift_details[shift]["end"]
+                if shift != "OFF"
+                else 99
+        )
+    )
+
+
+    # ------------------------------------------------------
+    # Create readable shift times
+    # ------------------------------------------------------
+
+    weekly_rota_df["shift_time"] = (
+        weekly_rota_df.apply(
+            lambda row:
+                (
+                    f"{int(row['shift_start']):02d}:00"
+                    f" - "
+                    f"{int(row['shift_end']):02d}:00"
+                )
+                if row["shift"] != "OFF"
+                else "OFF",
+            axis=1
+        )
+    )
+
+
+    # ------------------------------------------------------
+    # Keep only employees who are working
+    # OFF employees are excluded from the operational table
+    # ------------------------------------------------------
+
+    working_rota_df = weekly_rota_df[
+        weekly_rota_df["shift"] != "OFF"
+    ].copy()
+
+
+    # ------------------------------------------------------
+    # Find all weeks in chronological order
+    # ------------------------------------------------------
+
+    rota_weeks = (
+        working_rota_df[
+            ["iso_year", "iso_week"]
+        ]
+        .drop_duplicates()
+        .sort_values(
+            by=[
+                "iso_year",
+                "iso_week"
+            ]
+        )
+    )
+
+
+    weekly_rota_tables = {}
+
+
+    # ------------------------------------------------------
+    # Create and display one table for each week
+    # ------------------------------------------------------
+
+    for week_number, week_row in enumerate(
+        rota_weeks.itertuples(index=False),
+        start=1
+    ):
+
+        iso_year = week_row.iso_year
+        iso_week = week_row.iso_week
+
+        week_df = working_rota_df[
+            (
+                working_rota_df["iso_year"]
+                == iso_year
+            )
+            &
+            (
+                working_rota_df["iso_week"]
+                == iso_week
+            )
+        ].copy()
+
+
+        # Sort each day from earliest shift to latest shift
+        week_df = (
+            week_df
+            .sort_values(
+                by=[
+                    "date",
+                    "shift_start",
+                    "shift_end",
+                    "role",
+                    "employee_name"
+                ]
+            )
+            .reset_index(drop=True)
+        )
+
+
+        # Add a staff position number for each shift
+        week_df["staff_number"] = (
+            week_df
+            .groupby(
+                [
+                    "date",
+                    "shift"
+                ]
+            )
+            .cumcount()
+            + 1
+        )
+
+
+        # Format the date for easier reading
+        week_df["display_date"] = (
+            week_df["date"]
+            .dt
+            .strftime("%d/%m/%Y")
+        )
+
+
+        # Select the columns to display
+        week_display_df = week_df[
+            [
+                "display_date",
+                "day_name",
+                "shift",
+                "shift_time",
+                "staff_number",
+                "employee_id",
+                "employee_name",
+                "role",
+                "contract_hours",
+                "hours"
+            ]
+        ].copy()
+
+
+        week_display_df = week_display_df.rename(
+            columns={
+                "display_date": "date",
+                "day_name": "day",
+                "shift": "shift",
+                "shift_time": "shift_time",
+                "staff_number": "staff_no",
+                "employee_id": "employee_id",
+                "employee_name": "employee_name",
+                "role": "role",
+                "contract_hours": "weekly_contract",
+                "hours": "shift_hours"
+            }
+        )
+
+
+        # Save each weekly table in a dictionary
+        weekly_rota_tables[
+            (iso_year, iso_week)
+        ] = week_display_df
+
+
+        week_start = week_df["date"].min()
+        week_end = week_df["date"].max()
+
+
+        print("\n")
+        print("=" * 100)
+
+        print(
+            f"ROTA WEEK {week_number} "
+            f"| ISO WEEK {iso_week}, {iso_year}"
+        )
+
+        print(
+            f"{week_start.strftime('%A %d %B %Y')} "
+            f"to "
+            f"{week_end.strftime('%A %d %B %Y')}"
+        )
+
+        print("=" * 100)
+
+        display(
+            week_display_df
+        )
+
+
+    print("\n")
+    print("=" * 60)
+    print("WEEKLY ROTA TABLES CREATED")
+    print("=" * 60)
+
+    print(
+        f"Number of weekly tables: "
+        f"{len(weekly_rota_tables)}"
+    )
