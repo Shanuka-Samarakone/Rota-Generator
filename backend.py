@@ -445,7 +445,6 @@ def add_approved_leave_constraints(
                 == 0
             )
 
-
 def add_unavailability_constraints(
     model: cp_model.CpModel,
     work: dict,
@@ -479,7 +478,6 @@ def add_unavailability_constraints(
                     )
                     == 0
                 )
-
 
 def add_weekly_hours_constraints(
     model: cp_model.CpModel,
@@ -559,7 +557,6 @@ def add_weekly_hours_constraints(
 
             model.Add(weekly_hours == target_hours)
 
-
 def add_rest_constraints(
     model: cp_model.CpModel,
     work: dict,
@@ -597,7 +594,6 @@ def add_rest_constraints(
                     <= 1
                 )
 
-
 def add_seven_day_working_limit(
     model: cp_model.CpModel,
     work: dict,
@@ -628,7 +624,6 @@ def add_seven_day_working_limit(
                 )
                 <= 6
             )
-
 
 def add_operational_constraints(
     model: cp_model.CpModel,
@@ -727,7 +722,6 @@ def add_operational_constraints(
             >= int(store_requirements["minimum_closers"])
         )
 
-
 def validate_staffing_pool(
     *,
     managers: list[str],
@@ -763,7 +757,6 @@ def validate_staffing_pool(
                 f"The rota requires {required} {name}, "
                 f"but only {available} are available in the employee data."
             )
-
 
 # ==========================================================
 # SOFT CONSTRAINTS
